@@ -82,20 +82,33 @@ export function initMQTT() {
         // Check if gas leakage is detected (Threshold: 1200)
         if (value > 1200) {
           gasReading.status = 'GAS_DETECTED';
+          console.log(`🚨 ALERT TRIGGERED! Gas value ${value} exceeds threshold 1200`);
           
           // Send email alerts to all subscribers
           const subscribers = getSubscribers();
-          console.log(`Sending alerts to ${subscribers.length} subscribers...`);
+          console.log(`📧 Subscribers found: ${subscribers.length}`);
+          console.log(`Subscriber list:`, subscribers);
+          
           if (subscribers.length > 0) {
             for (const subscriber of subscribers) {
-              await sendAlertEmail(
-                subscriber.email,
-                `⚠️ GAS LEAKAGE DETECTED! Current Value: ${value} (Threshold: 1200) - IMMEDIATE ACTION REQUIRED!`
-              );
-              console.log(`✓ Alert sent to ${subscriber.email}`);
+              try {
+                await sendAlertEmail(
+                  subscriber.email,
+                  `⚠️ GAS LEAKAGE DETECTED! Current Value: ${value} (Threshold: 1200) - IMMEDIATE ACTION REQUIRED!`
+                );
+                console.log(`✓ Alert email sent to ${subscriber.email}`);
+              } catch (emailError) {
+                console.error(`✗ Failed to send alert to ${subscriber.email}:`, emailError.message);
+              }
             }
           } else {
             console.warn('⚠️ No subscribers found for alert');
+          }
+        } else {
+          // Reset to NORMAL if below threshold
+          if (gasReading.status === 'GAS_DETECTED') {
+            console.log(`✅ Gas level returned to normal (${value} < 1200)`);
+            gasReading.status = 'NORMAL';
           }
         }
       } else if (topic === MQTT_TOPICS.gas_status) {
