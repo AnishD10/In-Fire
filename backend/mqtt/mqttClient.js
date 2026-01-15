@@ -80,9 +80,10 @@ export function initMQTT() {
         gasReading.timestamp = new Date();
 
         // Check if gas leakage is detected (Threshold: 1200)
-        if (value > 1200) {
+        const THRESHOLD = process.env.GAS_THRESHOLD || 1200;
+        if (value > THRESHOLD) {
           gasReading.status = 'GAS_DETECTED';
-          console.log(`🚨 ALERT TRIGGERED! Gas value ${value} exceeds threshold 1200`);
+          console.log(`🚨 ALERT TRIGGERED! Gas value ${value} exceeds threshold ${THRESHOLD}`);
           
           // Send email alerts to all subscribers
           const subscribers = await getSubscribers();
