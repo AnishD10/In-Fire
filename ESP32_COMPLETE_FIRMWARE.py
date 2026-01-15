@@ -1,0 +1,443 @@
+# Complete IoT Gas Detection System - ESP32 Firmware
+# Handles all hardware control via MQTT commands
+# MicroPython 1.20.0+
+
+import network
+import time
+import machine
+from machine import Pin, PWM, ADC
+from umqtt.simple import MQTTClient
+import json
+
+# ==========================================
+# GPIO Configuration
+# ==========================================
+GPIO_RELAY = 33          # Relay module (gas valve control)
+GPIO_SERVO = 14          # Servo motor (vent control) - PWM
+GPIO_SENSOR = 34         # MQ-2 Gas Sensor (ADC input)
+GPIO_BUZZER = 27         # Buzzer alarm
+GPIO_LED_GREEN = 25      # Green LED (status)
+GPIO_LED_RED = 26        # Red LED (alert)
+
+# ==========================================
+# Threshold Configuration
+# ==========================================
+THRESHOLD = 1200         # ADC value for gas alert
+HOLD_TIME = 10           # Seconds to hold alert before recovery
+
+# ==========================================
+# MQTT Configuration
+# ==========================================
+MQTT_BROKER = 'd9224a87ae11416ebdfea8fc7ef45621.s1.eu.hivemq.cloud'
+MQTT_PORT = 8883
+MQTT_USER = 'LPG_Detection'
+MQTT_PASSWORD = 'Fire@101'
+MQTT_CLIENT_ID = 'esp32-gas-detector-' + str(machine.unique_id())
+
+MQTT_TOPIC_GAS = 'LPG/gas/value'
+MQTT_TOPIC_STATUS = 'LPG/gas/status'
+MQTT_TOPIC_CONTROL = 'LPG/system/control'
+MQTT_TOPIC_LOG = 'LPG/system/log'
+
+# ==========================================
+# WiFi Configuration (Dual Network Fallback)
+# ==========================================
+WIFI_NETWORKS = [
+    ('IIC_WIFI', '!tah@rIntl2025'),
+    ('oh-ho!', 'Dangals.LM10')
+]
+
+# ==========================================
+# Global State
+# ==========================================
+wifi_connected = False
+mqtt_connected = False
+mqtt_client = None
+system_on = True
+alert_active = False
+alert_timer = 0
+last_gas_value = 0
+
+# ==========================================
+# Hardware Initialization
+# ==========================================
+print("Initializing hardware...")
+
+# Relay (GPIO 33) - Controls gas valve
+relay = Pin(GPIO_RELAY, Pin.OUT)
+relay.off()  # Default: Relay OFF (gas valve closed)
+print("  ✓ Relay (GPIO 33) initialized")
+
+# Servo (GPIO 14) - PWM control
+servo = PWM(Pin(GPIO_SERVO), freq=50)
+servo.duty(38)  # Default: 0° (closed position)
+print("  ✓ Servo (GPIO 14) PWM initialized")
+
+# Gas Sensor (GPIO 34) - ADC input
+adc = ADC(Pin(GPIO_SENSOR))
+adc.atten(ADC.ATTN_11DB)  # 3.3V range
+adc.width(ADC.WIDTH_12BIT)  # 12-bit (0-4095)
+print("  ✓ Gas Sensor (GPIO 34) ADC initialized")
+
+# Buzzer (GPIO 27) - Digital output
+buzzer = Pin(GPIO_BUZZER, Pin.OUT)
+buzzer.off()
+print("  ✓ Buzzer (GPIO 27) initialized")
+
+# LEDs (GPIO 25, 26) - Digital outputs
+led_green = Pin(GPIO_LED_GREEN, Pin.OUT)
+led_red = Pin(GPIO_LED_RED, Pin.OUT)
+led_green.off()
+led_red.off()
+print("  ✓ LEDs (GPIO 25, 26) initialized")
+
+print("\n✓ All hardware initialized!\n")
+
+# ==========================================
+# WiFi Connection (Dual Network with Fallback)
+# ==========================================
+def connect_wifi():
+    global wifi_connected
+    
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    
+    for ssid, password in WIFI_NETWORKS:
+        print(f"Attempting: {ssid}...")
+        wlan.connect(ssid, password)
+        
+        timeout = 15
+        while not wlan.isconnected() and timeout > 0:
+            print(f"  Waiting... ({timeout}s)")
+            time.sleep(1)
+            timeout -= 1
+        
+        if wlan.isconnected():
+            print(f"✓ Connected to {ssid}! IP: {wlan.ifconfig()[0]}")
+            wifi_connected = True
+            return True
+    
+    print("✗ WiFi Connection Failed - All networks tried!")
+    wifi_connected = False
+    return False
+
+# ==========================================
+# MQTT Connection
+# ==========================================
+def on_mqtt_message(topic, msg):
+    """Handle incoming MQTT messages"""
+    global system_on, alert_active
+    
+    message = msg.decode('utf-8')
+    topic_str = topic.decode('utf-8') if isinstance(topic, bytes) else topic
+    
+    print(f"[MQTT] {topic_str}: {message}")
+    
+    if topic_str == MQTT_TOPIC_CONTROL:
+        handle_command(message)
+
+def handle_command(command):
+    """Execute control commands from backend"""
+    global system_on, alert_active
+    
+    print(f">>> Executing command: {command}")
+    
+    if command == 'ON':
+        normal_mode()
+        send_log(f"System turned ON")
+        
+    elif command == 'OFF':
+        all_off()
+        send_log(f"System turned OFF")
+        
+    elif command == 'TEST':
+        test_alert()
+        send_log(f"Test alert triggered")
+    
+    # Relay commands
+    elif command == 'RELAY_ON':
+        relay.on()  # Relay ON = gas valve OPEN
+        send_log(f"Relay ON (Gas valve OPEN)")
+        print("  💨 Relay ON - Gas flowing")
+        
+    elif command == 'RELAY_OFF':
+        relay.off()  # Relay OFF = gas valve CLOSED
+        send_log(f"Relay OFF (Gas valve CLOSED)")
+        print("  🔒 Relay OFF - Gas blocked")
+    
+    # Servo commands
+    elif command == 'SERVO_0':
+        set_servo(0)
+        send_log(f"Servo moved to 0° (closed)")
+        print("  📍 Servo: 0° (Closed)")
+        
+    elif command == 'SERVO_90':
+        set_servo(90)
+        send_log(f"Servo moved to 90° (open)")
+        print("  📍 Servo: 90° (Open)")
+        
+    elif command == 'SERVO_180':
+        set_servo(180)
+        send_log(f"Servo moved to 180° (max)")
+        print("  📍 Servo: 180° (Max ventilation)")
+    
+    # LED commands
+    elif command == 'LED_GREEN':
+        led_green.on()
+        led_red.off()
+        send_log(f"Green LED ON")
+        print("  🟢 Green LED ON")
+        
+    elif command == 'LED_RED':
+        led_green.off()
+        led_red.on()
+        send_log(f"Red LED ON")
+        print("  🔴 Red LED ON")
+        
+    elif command == 'LED_OFF':
+        led_green.off()
+        led_red.off()
+        send_log(f"All LEDs OFF")
+        print("  ⚫ All LEDs OFF")
+    
+    # Buzzer commands
+    elif command == 'BUZZER_ON':
+        buzzer.on()
+        send_log(f"Buzzer ON")
+        print("  🔔 Buzzer ON")
+        
+    elif command == 'BUZZER_OFF':
+        buzzer.off()
+        send_log(f"Buzzer OFF")
+        print("  🔇 Buzzer OFF")
+    
+    # Integrated scenarios
+    elif command == 'ALERT_MODE':
+        alert_mode()
+        send_log(f"ALERT MODE activated")
+        
+    elif command == 'NORMAL_MODE':
+        normal_mode()
+        send_log(f"NORMAL MODE activated")
+        
+    elif command == 'SERVO_WITH_FAN':
+        # Emergency: open vent and close gas valve
+        servo.duty(77)  # Servo 90°
+        relay.off()     # Relay OFF (gas closed)
+        led_red.on()
+        led_green.off()
+        buzzer.on()
+        send_log(f"EMERGENCY: Servo 90° + Fan OFF + Alert")
+        print("  🚨 EMERGENCY: Servo open + Gas blocked + Alert!")
+        time.sleep(2)
+        buzzer.off()
+
+def set_servo(angle):
+    """Set servo to specific angle (0-180)"""
+    # Servo angle to PWM duty mapping (50Hz)
+    # 0° = 25, 90° = 77, 180° = 128
+    if angle == 0:
+        servo.duty(38)      # 0°
+    elif angle == 90:
+        servo.duty(77)      # 90°
+    elif angle == 180:
+        servo.duty(115)     # 180°
+    else:
+        # Linear interpolation for other angles
+        duty = int(38 + (angle / 180) * (115 - 38))
+        servo.duty(duty)
+
+def alert_mode():
+    """Activate alert mode"""
+    global alert_active
+    alert_active = True
+    led_green.off()
+    led_red.on()
+    relay.off()  # Gas valve CLOSED
+    servo.duty(77)  # Servo 90°
+    buzzer.on()
+    print("  ⚠️ ALERT MODE: Red LED + Relay OFF + Servo 90° + Buzzer ON")
+
+def normal_mode():
+    """Return to normal mode"""
+    global alert_active
+    alert_active = False
+    led_green.on()
+    led_red.off()
+    relay.on()  # Gas valve OPEN
+    servo.duty(38)  # Servo 0°
+    buzzer.off()
+    print("  ✅ NORMAL MODE: Green LED + Relay ON + Servo 0° + Buzzer OFF")
+
+def test_alert():
+    """Test alert sequence"""
+    print("  🧪 TEST ALERT SEQUENCE")
+    # Buzzer
+    for i in range(3):
+        buzzer.on()
+        time.sleep(0.2)
+        buzzer.off()
+        time.sleep(0.2)
+    
+    # LEDs
+    led_red.on()
+    led_green.off()
+    time.sleep(1)
+    
+    # Servo
+    servo.duty(77)  # 90°
+    time.sleep(1)
+    
+    # Relay
+    relay.off()
+    time.sleep(1)
+    
+    # Return to normal
+    normal_mode()
+
+def all_off():
+    """Turn off everything"""
+    relay.off()
+    servo.duty(38)
+    buzzer.off()
+    led_green.off()
+    led_red.off()
+    print("  ⚫ All systems OFF")
+
+def send_log(message):
+    """Send log message to backend"""
+    if mqtt_connected:
+        try:
+            mqtt_client.publish(MQTT_TOPIC_LOG, message)
+        except:
+            pass
+
+def connect_mqtt():
+    """Connect to MQTT broker"""
+    global mqtt_client, mqtt_connected
+    
+    print(f"Connecting to MQTT: {MQTT_BROKER}:{MQTT_PORT}...")
+     
+    try:
+        mqtt_client = MQTTClient(
+            MQTT_CLIENT_ID,
+            MQTT_BROKER,
+            port=MQTT_PORT,
+            user=MQTT_USER,
+            password=MQTT_PASSWORD,
+            ssl=True,
+            ssl_params={"server_hostname": MQTT_BROKER},
+            keepalive=60
+        )
+        
+        mqtt_client.set_callback(on_mqtt_message)
+        mqtt_client.connect()
+        mqtt_client.subscribe(MQTT_TOPIC_CONTROL)
+        
+        print("✓ MQTT Connected!")
+        mqtt_connected = True
+        
+        # Send startup message
+        mqtt_client.publish(MQTT_TOPIC_STATUS, "SYSTEM_READY")
+        mqtt_client.publish(MQTT_TOPIC_LOG, "System started")
+        
+        return True
+    except Exception as e:
+        print(f"✗ MQTT Connection failed: {e}")
+        mqtt_connected = False
+        return False
+
+def read_gas_sensor():
+    """Read gas sensor value"""
+    try:
+        raw = adc.read()
+        # Convert to readable value (0-4095 scale)
+        return raw
+    except:
+        return 0
+
+# ==========================================
+# Main Program
+# ==========================================
+print("\n=== IoT Gas Leakage Detection System ===\n")
+
+# Connect to WiFi
+if connect_wifi():
+    # Connect to MQTT
+    if connect_mqtt():
+        print("\n✓ System Ready! Starting monitoring...\n")
+        
+        # Initialize normal mode
+        normal_mode()
+        
+        read_count = 0
+        
+        while True:
+            try:
+                # Check MQTT messages
+                if mqtt_connected:
+                    try:
+                        mqtt_client.check_msg()
+                    except OSError as e:
+                        print(f"✗ MQTT disconnected, attempting to reconnect...")
+                        mqtt_connected = False
+                        if connect_mqtt():
+                            print("✓ MQTT Reconnected!")
+                        continue
+                
+                # Read gas sensor every 2 seconds
+                if read_count >= 20:  # Every 2 seconds (20 * 0.1s)
+                    gas_value = read_gas_sensor()
+                    last_gas_value = gas_value
+                    
+                    if system_on:
+                        # Check gas threshold
+                        if gas_value > THRESHOLD:
+                            if not alert_active:
+                                print(f"\n⚠️  GAS ALERT! Value: {gas_value} (> {THRESHOLD})")
+                                alert_mode()
+                                
+                                # Publish alert
+                                if mqtt_connected:
+                                    mqtt_client.publish(MQTT_TOPIC_GAS, str(gas_value))
+                                    mqtt_client.publish(MQTT_TOPIC_STATUS, 
+                                        f"GAS_DETECTED - Value: {gas_value} - EMERGENCY")
+                                    send_log(f"GAS ALERT: Value {gas_value}")
+                                
+                                alert_timer = HOLD_TIME
+                        else:
+                            # Gas level normal
+                            if alert_active and alert_timer <= 0:
+                                print(f"\n✓ Gas level returning to normal ({gas_value})")
+                                normal_mode()
+                                if mqtt_connected:
+                                    mqtt_client.publish(MQTT_TOPIC_STATUS, "NORMAL")
+                                    send_log(f"System recovered. Gas: {gas_value}")
+                            
+                            # Publish normal reading
+                            if mqtt_connected:
+                                mqtt_client.publish(MQTT_TOPIC_GAS, str(gas_value))
+                            print(f"Gas: {gas_value} ADC (Normal)")
+                        
+                        # Decrease alert timer
+                        if alert_timer > 0:
+                            alert_timer -= 1
+                    
+                    read_count = 0
+                
+                read_count += 1
+                time.sleep(0.1)
+                
+            except KeyboardInterrupt:
+                print("\nShutdown...")
+                all_off()
+                break
+            except Exception as e:
+                print(f"Error in main loop: {e}")
+                time.sleep(1)
+    else:
+        print("Failed to connect to MQTT. Check credentials.")
+else:
+    print("Failed to connect to WiFi. Check credentials.")
+
+print("\nSystem halted.")
