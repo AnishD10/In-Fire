@@ -6,15 +6,20 @@ dotenv.config();
 // ==========================================
 // Email Transporter Configuration
 // ==========================================
-// Using port 465 with SSL (TLS on 587 times out on Render)
+// Using port 587 with explicit TLS configuration and timeout
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
-  port: 465,
-  secure: true, // SSL
+  port: 587,
+  secure: false, // TLS
+  requireTLS: true,
+  connectionTimeout: 10000, // 10 seconds
+  socketTimeout: 10000,
   auth: {
     user: process.env.SMTP_USER || 'manxekhatra@gmail.com',
     pass: process.env.SMTP_PASSWORD || 'cioe umpl yavf roje'
-  }
+  },
+  logger: true,
+  debug: true
 });
 
 // ==========================================
