@@ -85,7 +85,7 @@ export function initMQTT() {
           console.log(`🚨 ALERT TRIGGERED! Gas value ${value} exceeds threshold 1200`);
           
           // Send email alerts to all subscribers
-          const subscribers = getSubscribers();
+          const subscribers = await getSubscribers();
           console.log(`📧 Subscribers found: ${subscribers.length}`);
           console.log(`Subscriber list:`, subscribers);
           

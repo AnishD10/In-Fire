@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
+import { connectMongoDB } from './db/mongoConnection.js';
 import { initMQTT } from './mqtt/mqttClient.js';
 import gasRoutes from './routes/gasRoutes.js';
 import controlRoutes from './routes/controlRoutes.js';
@@ -57,8 +58,12 @@ app.use((err, req, res, next) => {
 // ==========================================
 // Start Server & MQTT
 // ==========================================
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`✓ Backend server running on http://localhost:${PORT}`);
+  
+  // Connect to MongoDB
+  await connectMongoDB();
+  
   console.log('Initializing MQTT connection...');
   
   // Initialize MQTT connection
